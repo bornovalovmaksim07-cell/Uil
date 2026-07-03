@@ -1,0 +1,500 @@
+import sqlite3
+import urllib.request
+import urllib.parse
+import json
+import time
+import logging
+import re
+import datetime
+import ssl
+import sys
+import traceback
+
+# ==================== КОНФИГУРАЦИЯ БОТА ====================
+TOKEN = "8679711038:AAHVohQbXIbArSmIQKGBJ-bER5w4Jz-aAsE" 
+ADMIN_IDS = [7929388828]  # ID админа
+
+# НАСТРОЙКА КАНАЛА ДЛЯ ОБЯЗАТЕЛЬНОЙ ПОДПИСКИ
+CHANNEL_ID = -1004435328184  # ID канала @MagicCheatRessel
+CHANNEL_LINK = "https://t.me/MagicCheatRessel"  # Ссылка на канал @MagicCheatRessel
+
+# ХОЧЕШЬ ЛИ ТЕСТИРОВАТЬ ПОДПИСКУ НА СЕБЕ (АДМИНЕ)?
+# Если True - бот будет просить тебя подписаться. После тестов можно поставить False.
+TEST_SUB_FOR_ADMIN = True  
+
+# НАСТРОЙКИ ТОВАРА И ОПЛАТЫ
+PRODUCT_NAME = "Magic VIP 1d"
+PRODUCT_PRICE = "270р"
+BANK_PHONE = "+79084950103"
+BANK_NAME = "Озон Банк"
+# ============================================================
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO,
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
+
+bot_id = None
+
+# --- Инициализация БД ---
+def init_db():
+    try:
+        conn = sqlite3.connect('bot_data.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_string TEXT UNIQUE NOT NULL,
+                product TEXT NOT NULL,
+                sold_to_user_id INTEGER,
+                sold_at TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pending_bank_payments (
+                user_id INTEGER PRIMARY KEY,
+                product TEXT NOT NULL,
+                status TEXT NOT NULL,
+                timestamp TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info("База данных успешно инициализирована.")
+    except Exception as e:
+        logger.error("Ошибка при работе с базой данных SQLite:")
+        traceback.print_exc()
+        raise e
+
+def add_key_to_db(key_string, product_name):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO keys (key_string, product) VALUES (?, ?)", (key_string, product_name))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def get_available_key(product_name):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT key_string FROM keys WHERE product = ? AND sold_to_user_id IS NULL LIMIT 1", (product_name,))
+    key = cursor.fetchone()
+    conn.close()
+    return key[0] if key else None
+
+def mark_key_as_sold(key_string, user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    cursor.execute("UPDATE keys SET sold_to_user_id = ?, sold_at = ? WHERE key_string = ?", (user_id, now, key_string))
+    conn.commit()
+    conn.close()
+
+def get_all_keys(product_name):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT key_string, sold_to_user_id FROM keys WHERE product = ?", (product_name,))
+    keys_data = cursor.fetchall()
+    conn.close()
+    return keys_data
+
+def add_pending_bank_payment(user_id, product):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    cursor.execute("INSERT OR REPLACE INTO pending_bank_payments (user_id, product, status, timestamp) VALUES (?, ?, ?, ?)",
+                   (user_id, product, 'pending_screenshot', now))
+    conn.commit()
+    conn.close()
+
+def get_pending_bank_payment(user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT product, status FROM pending_bank_payments WHERE user_id = ?", (user_id,))
+    payment = cursor.fetchone()
+    conn.close()
+    return {'product': payment[0], 'status': payment[1]} if payment else None
+
+def update_pending_bank_payment_status(user_id, status):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE pending_bank_payments SET status = ? WHERE user_id = ?", (status, user_id))
+    conn.commit()
+    conn.close()
+
+def remove_pending_bank_payment(user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM pending_bank_payments WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# --- HTTP Запросы к Telegram API ---
+def bot_request(method, data=None):
+    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
+    try:
+        headers = {'Content-Type': 'application/json'}
+        data_bytes = json.dumps(data).encode('utf-8') if data else None
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method='POST' if data else 'GET')
+        
+        # Обход проверки SSL-сертификатов для хостингов со старым ПО
+        context = ssl._create_unverified_context()
+        
+        with urllib.request.urlopen(req, timeout=15, context=context) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode('utf-8'))
+        except:
+            pass
+        logger.error(f"HTTP Error в методе {method}: {e}")
+        traceback.print_exc() # Вывод полного стека ошибок
+        return None
+    except Exception as e:
+        logger.error(f"Сетевая ошибка при запросе {method}: {e}")
+        traceback.print_exc() # Вывод полного стека ошибок
+        return None
+
+# --- Проверка подписки ---
+def is_subscribed(user_id) -> bool:
+    # Если CHANNEL_ID не настроен, пропускаем проверку
+    if CHANNEL_ID == -1004435328184 or CHANNEL_ID == 0: # Используем твой CHANNEL_ID по умолчанию
+        return True
+    
+    res = bot_request("getChatMember", {"chat_id": CHANNEL_ID, "user_id": user_id})
+    
+    # Если при проверке произошла ошибка (например, бот не админ в канале)
+    if not res or not res.get("ok"):
+        logger.warning(f"Ошибка при получении статуса пользователя {user_id} в канале {CHANNEL_ID}. Возможно, бот не является админом канала или CHANNEL_ID неверный. Предполагаем, что не подписан.")
+        # В этом случае мы возвращаем False, чтобы принудительно показать окно подписки.
+        return False
+
+    status = res["result"]["status"]
+    return status in ['member', 'creator', 'administrator']
+
+def check_and_prompt_subscription(user_id, chat_id, message_id=None, is_cb=False) -> bool:
+    # Если админ и TEST_SUB_FOR_ADMIN выключен, пропускаем проверку
+    if user_id in ADMIN_IDS and not TEST_SUB_FOR_ADMIN:
+        return True
+        
+    if is_subscribed(user_id):
+        return True
+
+    text = (
+        "⚠️ **ДОСТУП ОГРАНИЧЕН!**\n\n"
+        "Для использования бота и покупки приватных ключей необходимо быть подписанным на наш официальный Telegram-канал! 👇"
+    )
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": "📢 Перейти в канал", "url": CHANNEL_LINK}],
+            [{"text": "✅ Проверить подписку", "callback_data": "check_subscription"}]
+        ]
+    }
+
+    if is_cb and message_id:
+        bot_request("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "reply_markup": reply_markup,
+            "parse_mode": "Markdown"
+        })
+    else:
+        bot_request("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": reply_markup,
+            "parse_mode": "Markdown"
+        })
+    return False
+
+def send_main_menu(chat_id, user_first_name):
+    text = (
+        f"👋 **Приветствуем, {user_first_name}!**\n\n"
+        f"Ты попал в магазин приватного софта **Magic Cheat** для игры *Oxide: Survival Island*! 🛡️\n\n"
+        f"🔥 **Доступные товары:**\n"
+        f"└  `{PRODUCT_NAME}` — мощный функционал на 24 часа за **{PRODUCT_PRICE}**.\n\n"
+        f"Нажми на кнопку ниже для моментального оформления заказа! 👇"
+    )
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": f"💎 Купить {PRODUCT_NAME} | {PRODUCT_PRICE}", "callback_data": "buy_magic_vip_1d"}]
+        ]
+    }
+    bot_request("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": reply_markup,
+        "parse_mode": "Markdown"
+    })
+
+# --- Обработка обновлений ---
+def handle_update(update):
+    global bot_id
+    
+    if "message" in update:
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        user_id = msg["from"]["id"]
+        text = msg.get("text", "")
+
+        # 1. ОТВЕТ АДМИНИСТРАТОРА (REPLY)
+        if user_id in ADMIN_IDS and msg.get("reply_to_message"):
+            reply_to = msg["reply_to_message"]
+            if reply_to["from"]["id"] == bot_id:
+                text_to_parse = reply_to.get("text") or reply_to.get("caption") or ""
+                match = re.search(r"(?:Пользователь[:\s*]*`?|user_id\s*=\s*|Пользователь\s+)(\d+)", text_to_parse, re.IGNORECASE)
+                if match:
+                    target_user_id = int(match.group(1))
+                    if text:
+                        res = bot_request("sendMessage", {
+                            "chat_id": target_user_id,
+                            "text": f"✉️ **Сообщение от администратора:**\n\n{text}",
+                            "parse_mode": "Markdown"
+                        })
+                        if res and res.get("ok"):
+                            bot_request("sendMessage", {"chat_id": chat_id, "text": f"✅ Ответ доставлен пользователю `{target_user_id}`."})
+                        else:
+                            bot_request("sendMessage", {"chat_id": chat_id, "text": "❌ Ошибка отправки."})
+                    else:
+                        bot_request("sendMessage", {"chat_id": chat_id, "text": "⚠️ Бот пересылает только текст."})
+                    return
+
+        # 2. КОМАНДЫ
+        if text.startswith("/"):
+            parts = text.split()
+            cmd = parts[0].lower()
+            args = parts[1:]
+
+            if cmd == "/start":
+                if not check_and_prompt_subscription(user_id, chat_id):
+                    return
+                send_main_menu(chat_id, msg["from"].get("first_name", "Пользователь"))
+                return
+
+            elif cmd == "/reply":
+                if user_id not in ADMIN_IDS: return
+                try:
+                    target_user_id = int(args[0])
+                    message_text = " ".join(args[1:])
+                    res = bot_request("sendMessage", {
+                        "chat_id": target_user_id,
+                        "text": f"✉️ **Сообщение от администратора:**\n\n{message_text}",
+                        "parse_mode": "Markdown"
+                    })
+                    if res and res.get("ok"):
+                        bot_request("sendMessage", {"chat_id": chat_id, "text": f"✅ Отправлено пользователю `{target_user_id}`."})
+                except Exception as e:
+                    logger.error(f"Ошибка в команде /reply: {e}")
+                    traceback.print_exc()
+                    bot_request("sendMessage", {"chat_id": chat_id, "text": "⚠️ Использование: `/reply <user_id> <текст>`"})
+                return
+
+            elif cmd == "/addkey":
+                if user_id not in ADMIN_IDS: return
+                try:
+                    key_string = args[0]
+                    product_name_arg = args[1] if len(args) > 1 else PRODUCT_NAME
+                    if add_key_to_db(key_string, product_name_arg):
+                        bot_request("sendMessage", {"chat_id": chat_id, "text": f"✅ Ключ `{key_string}` добавлен."})
+                except Exception as e:
+                    logger.error(f"Ошибка в команде /addkey: {e}")
+                    traceback.print_exc()
+                    bot_request("sendMessage", {"chat_id": chat_id, "text": "⚠️ Использование: `/addkey <ключ>`"})
+                return
+
+            elif cmd == "/keys":
+                if user_id not in ADMIN_IDS: return
+                product_name_filter = args[0] if args else PRODUCT_NAME
+                keys_data = get_all_keys(product_name_filter)
+                if not keys_data:
+                    bot_request("sendMessage", {"chat_id": chat_id, "text": "Нет ключей."})
+                    return
+                response = f"📋 **Список ключей для {product_name_filter}:**\n"
+                for key, sold_to in keys_data:
+                    status = f" (Продан: `{sold_to}`)" if sold_to else " (Доступен)"
+                    response += f"- `{key}`{status}\n"
+                bot_request("sendMessage", {"chat_id": chat_id, "text": response, "parse_mode": "Markdown"})
+                return
+
+            elif cmd == "/confirm":
+                if user_id not in ADMIN_IDS: return
+                try:
+                    target_user_id = int(args[0])
+                    pending_payment = get_pending_bank_payment(target_user_id)
+                    if pending_payment:
+                        product_to_issue = pending_payment['product']
+                        key = get_available_key(product_to_issue)
+                        if key:
+                            mark_key_as_sold(key, target_user_id)
+                            remove_pending_bank_payment(target_user_id)
+                            bot_request("sendMessage", {
+                                "chat_id": target_user_id,
+                                "text": f"🎉 **Ваш платеж успешно подтвержден!**\n\n📦 Купленный товар: `{product_to_issue}`\n🔑 Ваш ключ:\n`{key}`\n\nПриятной игры! 🚀",
+                                "parse_mode": "Markdown"
+                            })
+                            bot_request("sendMessage", {"chat_id": chat_id, "text": "✅ Ключ выдан."})
+                        else:
+                            bot_request("sendMessage", {"chat_id": chat_id, "text": f"🚨 **ОШИБКА:** Нет доступных ключей для **{product_to_issue}**!"})
+                    else:
+                        bot_request("sendMessage", {"chat_id": chat_id, "text": f"❌ Нет активных платежей от пользователя `{target_user_id}`."})
+                except Exception as e:
+                    logger.error(f"Ошибка в команде /confirm: {e}")
+                    traceback.print_exc()
+                    bot_request("sendMessage", {"chat_id": chat_id, "text": "⚠️ Использование: `/confirm <user_id>`"})
+                return
+
+        # 3. ПОЛЬЗОВАТЕЛИ (ЧЕКИ)
+        if not check_and_prompt_subscription(user_id, chat_id):
+            return
+
+        pending_payment = get_pending_bank_payment(user_id)
+        if pending_payment and pending_payment['status'] in ['pending_screenshot', 'waiting_admin']:
+            bot_request("sendMessage", {
+                "chat_id": chat_id,
+                "text": "✅ **Чек принят на проверку!**\n\nОжидайте подтверждения администратора. Обычно это занимает 5-15 минут.",
+                "parse_mode": "Markdown"
+            })
+            update_pending_bank_payment_status(user_id, 'waiting_admin')
+
+            bot_request("forwardMessage", {
+                "chat_id": ADMIN_IDS[0],
+                "from_chat_id": chat_id,
+                "message_id": msg["message_id"]
+            })
+
+            username_str = f"@{msg['from'].get('username', '')}" if msg['from'].get('username') else msg['from'].get('first_name', '')
+            bot_request("sendMessage", {
+                "chat_id": ADMIN_IDS[0],
+                "text": f"📥 **ПОЛУЧЕН НОВЫЙ ЧЕК ОБ ОПЛАТЕ!**\n\n👤 **Пользователь:** `{user_id}` ({username_str})\n📦 **Товар:** `{pending_payment['product']}`\n\n🔑 Для выдачи ключа:\n`/confirm {user_id}`",
+                "parse_mode": "Markdown"
+            })
+        elif not text.startswith('/'): # Только если это не команда
+             bot_request("sendMessage", {
+                "chat_id": chat_id,
+                "text": "❌ **Неизвестный запрос.**\n\nИспользуйте кнопки меню для взаимодействия с ботом или команду /start.",
+                "parse_mode": "Markdown"
+            })
+
+    elif "callback_query" in update:
+        cb = update["callback_query"]
+        cb_id = cb["id"]
+        user_id = cb["from"]["id"]
+        chat_id = cb["message"]["chat"]["id"]
+        msg_id = cb["message"]["message_id"]
+        data = cb["data"]
+
+        if data == "check_subscription":
+            bot_request("answerCallbackQuery", {"callback_query_id": cb_id})
+            if is_subscribed(user_id):
+                bot_request("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
+                send_main_menu(chat_id, cb["from"].get("first_name", "Пользователь"))
+            else:
+                bot_request("answerCallbackQuery", {"callback_query_id": cb_id, "text": "❌ Вы всё еще не подписались на канал!", "show_alert": True})
+            return
+
+        # Проверка подписки для всех коллбэков, кроме check_subscription
+        if not check_and_prompt_subscription(user_id, chat_id, msg_id, is_cb=True):
+            bot_request("answerCallbackQuery", {"callback_query_id": cb_id})
+            return
+
+        if data == "buy_magic_vip_1d":
+            bot_request("answerCallbackQuery", {"callback_query_id": cb_id})
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🌐 Оплатить через платежную систему", "callback_data": "pay_gateway_magic_vip_1d"}],
+                    [{"text": "💳 Перевод СБП (на карту/номер)", "callback_data": "pay_bank_magic_vip_1d"}],
+                    [{"text": "⬅️ В меню", "callback_data": "back_to_menu"}]
+                ]
+            }
+            bot_request("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "text": f"🛒 **Оформление заказа:**\n\n📦 Товар: `{PRODUCT_NAME}`\n💰 К оплате: **{PRODUCT_PRICE}**\n\nПожалуйста, выбери удобный способ оплаты ниже 👇:",
+                "reply_markup": keyboard,
+                "parse_mode": "Markdown"
+            })
+
+        elif data == "pay_gateway_magic_vip_1d":
+            bot_request("answerCallbackQuery", {"callback_query_id": cb_id})
+            keyboard = {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "buy_magic_vip_1d"}]]}
+            bot_request("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "text": "⚠️ **Внимание!**\n\nЭта функция в данный момент недоступна.\nПожалуйста, используйте перевод СБП на карту/номер телефона.",
+                "reply_markup": keyboard,
+                "parse_mode": "Markdown"
+            })
+
+        elif data == "pay_bank_magic_vip_1d":
+            bot_request("answerCallbackQuery", {"callback_query_id": cb_id})
+            add_pending_bank_payment(user_id, PRODUCT_NAME)
+            keyboard = {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "buy_magic_vip_1d"}]]}
+            bot_request("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "text": f"💳 **Оплата переводом (СБП):**\n\nДля покупки `{PRODUCT_NAME}` переведите **{PRODUCT_PRICE}** по реквизитам:\n\n📱 Номер телефона: `{BANK_PHONE}`\n🏦 Банк получателя: **{BANK_NAME}**\n\n🛑 **ОБЯЗАТЕЛЬНОЕ ТРЕБОВАНИЕ:**\nПосле оплаты обязательно скиньте в этот чат чек (скриншот/документ), на котором четко видно:\n1️⃣ **Время оплаты**\n2️⃣ **Получателя платежа**\n3️⃣ **Сумму перевода ({PRODUCT_PRICE})**\n\nКак только вы пришлете скриншот, администратор проверит транзакцию и бот выдаст вам ключ автоматически! 🔑",
+                "reply_markup": keyboard,
+                "parse_mode": "Markdown"
+            })
+            username_str = f"@{cb['from'].get('username', '')}" if cb['from'].get('username') else cb['from'].get('first_name', '')
+            bot_request("sendMessage", {
+                "chat_id": ADMIN_IDS[0],
+                "text": f"📊 Пользователь `{user_id}` ({username_str}) открыл реквизиты для оплаты **{PRODUCT_NAME}**."
+            })
+
+        elif data == "back_to_menu":
+            bot_request("answerCallbackQuery", {"callback_query_id": cb_id})
+            bot_request("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
+            send_main_menu(chat_id, cb["from"].get("first_name", "Пользователь"))
+
+# --- Запуск Long Polling ---
+def main():
+    global bot_id
+    try:
+        init_db()
+    except Exception as e:
+        logger.critical(f"Критическая ошибка инициализации БД. Скрипт остановлен: {e}")
+        traceback.print_exc()
+        sys.exit(1) # Завершаем выполнение скрипта при критической ошибке
+
+    offset = 0
+    logger.info("Попытка подключения к Telegram API...")
+    
+    # Бесконечный цикл авторизации при старте
+    while bot_id is None:
+        try:
+            bot_info = bot_request("getMe")
+            if bot_info and bot_info.get("ok"):
+                bot_id = bot_info["result"]["id"]
+                logger.info(f"Бот успешно авторизован! ID: {bot_id}")
+            else:
+                logger.error("Не удалось связаться с Telegram. Проверьте токен. Повторная попытка через 5 секунд...")
+                time.sleep(5)
+        except Exception as e:
+            logger.error(f"Ошибка при попытке авторизации: {e}")
+            traceback.print_exc()
+            time.sleep(5)
+
+    logger.info("Бот запущен и ожидает обновлений!")
+    
+    while True:
+        try:
+            updates = bot_request("getUpdates", {"offset": offset, "timeout": 20})
+            if updates and updates.get("ok"):
+                for update in updates["result"]:
+                    offset = update["update_id"] + 1
+                    handle_update(update)
+        except Exception as e:
+            logger.error(f"Ошибка в цикле обновлений: {e}")
+            traceback.print_exc()
+        time.sleep(1)
+
+if __name__ == '__main__':
+    main()
